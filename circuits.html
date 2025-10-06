@@ -1,0 +1,2180 @@
+└── sdk
+    └── circomlib
+        └── circuits
+            ├── base64.circom
+            ├── bigint.circom
+            ├── bigint_func.circom
+            ├── fp.circom
+            ├── jwt.circom
+            ├── rsa.circom
+            ├── sha256.circom
+            ├── sha256general.circom
+            ├── sha256partial.circom
+            ├── string.circom
+            └── utils.circom
+
+
+/sdk/circomlib/circuits/base64.circom:
+--------------------------------------------------------------------------------
+ 1 | pragma circom 2.1.5;
+ 2 | 
+ 3 | template Base64Lookup() {
+ 4 |     signal input in;
+ 5 |     signal output out;
+ 6 | 
+ 7 |     // Assume that input inacters are valid Base64 inacters.
+ 8 |     // Map 'A'-'Z' to 0-25
+ 9 |     signal isUpper <-- in >= 65 && in <= 90;
+10 |     signal upperValue <== isUpper * (in - 65);
+11 | 
+12 |     // Map 'a'-'z' to 26-51
+13 |     signal isLower <-- in >= 97 && in <= 122;
+14 |     signal lowerValue <== isLower * (in - 97 + 26);
+15 | 
+16 |     // Map '0'-'9' to 52-61
+17 |     signal isDigit <-- in >= 48 && in <= 57;
+18 |     signal digitValue <== isDigit * (in - 48 + 52);
+19 | 
+20 |     // Map '+' to 62
+21 |     signal isPlus <-- in == 43;
+22 |     signal plusValue <-- isPlus * 62;
+23 | 
+24 |     // Map '/' to 63
+25 |     signal isSlash <-- in == 47;
+26 |     signal slashValue <-- isSlash * 63;
+27 | 
+28 |     // Map '=' to 0
+29 |     signal isEqSign <-- in == 61;
+30 |     signal eqsignValue <-- isEqSign * 0;
+31 | 
+32 |     // Map '' to 0
+33 |     signal isZero <-- in == 0;
+34 |     signal zeroValue <-- isZero * 0;
+35 | 
+36 |     // Combine the values
+37 |     out <== upperValue + lowerValue + digitValue + plusValue + slashValue + eqsignValue + zeroValue;
+38 | 
+39 |     1 === isUpper + isLower + isDigit + isPlus + isSlash + isEqSign + isZero;
+40 | }
+41 | 
+42 | template Base64Decoder() {
+43 |     signal input in[4];  // Assume input is a 4-inacter Base64 encoded string
+44 |     signal output out[3];  // Output is a 3-byte decoded string
+45 | 
+46 |     component lookup[4];
+47 |     for (var i = 0; i < 4; i++) {
+48 |         lookup[i] = Base64Lookup();
+49 |         lookup[i].in <== in[i];
+50 |     }
+51 | 
+52 |     // Reassemble the bits into bytes.
+53 |     out[0] <-- (lookup[0].out << 2) | (lookup[1].out >> 4);
+54 |     out[1] <-- ((lookup[1].out & 0xF) << 4) | (lookup[2].out >> 2);
+55 |     out[2] <-- ((lookup[2].out & 0x3) << 6) | lookup[3].out;
+56 | }
+57 | 
+58 | template Base64Decode(N) {
+59 |     signal input in[N];
+60 |     signal output out[N];
+61 | 
+62 |     assert(N % 4 == 0);
+63 | 
+64 |     var idx = 0;
+65 |     component decoders[N/4];
+66 | 
+67 |     for (var i = 0; i < N; i += 4) {
+68 |         decoders[i/4] = Base64Decoder();
+69 |         
+70 |         for (var j = 0; j < 4; j++) {
+71 |             decoders[i/4].in[j] <== in[i+j];
+72 |         }
+73 | 
+74 |         for (var k = 0; k < 3; k++) {
+75 |             out[idx + k] <== decoders[i/4].out[k];
+76 |         }
+77 | 
+78 |         idx += 3;
+79 |     }
+80 | 
+81 |     for (var i=idx; i < N; i ++) {
+82 |         out[i] <== 0;
+83 |     }
+84 | }
+85 | 
+
+
+--------------------------------------------------------------------------------
+/sdk/circomlib/circuits/bigint.circom:
+--------------------------------------------------------------------------------
+  1 | pragma circom 2.1.5;
+  2 | 
+  3 | include "circomlib/circuits/comparators.circom";
+  4 | include "circomlib/circuits/bitify.circom";
+  5 | include "circomlib/circuits/gates.circom";
+  6 | 
+  7 | include "bigint_func.circom";
+  8 | 
+  9 | // addition mod 2**n with carry bit
+ 10 | template ModSum(n) {
+ 11 |     assert(n <= 252);
+ 12 |     signal input a;
+ 13 |     signal input b;
+ 14 |     signal output sum;
+ 15 |     signal output carry;
+ 16 | 
+ 17 |     component n2b = Num2Bits(n + 1);
+ 18 |     n2b.in <== a + b;
+ 19 |     carry <== n2b.out[n];
+ 20 |     sum <== a + b - carry * (1 << n);
+ 21 | }
+ 22 | 
+ 23 | // a - b
+ 24 | template ModSub(n) {
+ 25 |     assert(n <= 252);
+ 26 |     signal input a;
+ 27 |     signal input b;
+ 28 |     signal output out;
+ 29 |     signal output borrow;
+ 30 |     component lt = LessThan(n);
+ 31 |     lt.in[0] <== a;
+ 32 |     lt.in[1] <== b;
+ 33 |     borrow <== lt.out;
+ 34 |     out <== borrow * (1 << n) + a - b;
+ 35 | }
+ 36 | 
+ 37 | // a - b - c
+ 38 | // assume a - b - c + 2**n >= 0
+ 39 | template ModSubThree(n) {
+ 40 |     assert(n + 2 <= 253);
+ 41 |     signal input a;
+ 42 |     signal input b;
+ 43 |     signal input c;
+ 44 |     assert(a - b - c + (1 << n) >= 0);
+ 45 |     signal output out;
+ 46 |     signal output borrow;
+ 47 |     signal b_plus_c;
+ 48 |     b_plus_c <== b + c;
+ 49 |     component lt = LessThan(n + 1);
+ 50 |     lt.in[0] <== a;
+ 51 |     lt.in[1] <== b_plus_c;
+ 52 |     borrow <== lt.out;
+ 53 |     out <== borrow * (1 << n) + a - b_plus_c;
+ 54 | }
+ 55 | 
+ 56 | template ModSumThree(n) {
+ 57 |     assert(n + 2 <= 253);
+ 58 |     signal input a;
+ 59 |     signal input b;
+ 60 |     signal input c;
+ 61 |     signal output sum;
+ 62 |     signal output carry;
+ 63 | 
+ 64 |     component n2b = Num2Bits(n + 2);
+ 65 |     n2b.in <== a + b + c;
+ 66 |     carry <== n2b.out[n] + 2 * n2b.out[n + 1];
+ 67 |     sum <== a + b + c - carry * (1 << n);
+ 68 | }
+ 69 | 
+ 70 | template ModSumFour(n) {
+ 71 |     assert(n + 2 <= 253);
+ 72 |     signal input a;
+ 73 |     signal input b;
+ 74 |     signal input c;
+ 75 |     signal input d;
+ 76 |     signal output sum;
+ 77 |     signal output carry;
+ 78 | 
+ 79 |     component n2b = Num2Bits(n + 2);
+ 80 |     n2b.in <== a + b + c + d;
+ 81 |     carry <== n2b.out[n] + 2 * n2b.out[n + 1];
+ 82 |     sum <== a + b + c + d - carry * (1 << n);
+ 83 | }
+ 84 | 
+ 85 | // product mod 2**n with carry
+ 86 | template ModProd(n) {
+ 87 |     assert(n <= 126);
+ 88 |     signal input a;
+ 89 |     signal input b;
+ 90 |     signal output prod;
+ 91 |     signal output carry;
+ 92 | 
+ 93 |     component n2b = Num2Bits(2 * n);
+ 94 |     n2b.in <== a * b;
+ 95 | 
+ 96 |     component b2n1 = Bits2Num(n);
+ 97 |     component b2n2 = Bits2Num(n);
+ 98 |     var i;
+ 99 |     for (i = 0; i < n; i++) {
+100 |         b2n1.in[i] <== n2b.out[i];
+101 |         b2n2.in[i] <== n2b.out[i + n];
+102 |     }
+103 |     prod <== b2n1.out;
+104 |     carry <== b2n2.out;
+105 | }
+106 | 
+107 | // split a n + m bit input into two outputs
+108 | template Split(n, m) {
+109 |     assert(n <= 126);
+110 |     signal input in;
+111 |     signal output small;
+112 |     signal output big;
+113 | 
+114 |     small <-- in % (1 << n);
+115 |     big <-- in \ (1 << n);
+116 | 
+117 |     component n2b_small = Num2Bits(n);
+118 |     n2b_small.in <== small;
+119 |     component n2b_big = Num2Bits(m);
+120 |     n2b_big.in <== big;
+121 | 
+122 |     in === small + big * (1 << n);
+123 | }
+124 | 
+125 | // split a n + m + k bit input into three outputs
+126 | template SplitThree(n, m, k) {
+127 |     assert(n <= 126);
+128 |     signal input in;
+129 |     signal output small;
+130 |     signal output medium;
+131 |     signal output big;
+132 | 
+133 |     small <-- in % (1 << n);
+134 |     medium <-- (in \ (1 << n)) % (1 << m);
+135 |     big <-- in \ (1 << n + m);
+136 | 
+137 |     component n2b_small = Num2Bits(n);
+138 |     n2b_small.in <== small;
+139 |     component n2b_medium = Num2Bits(m);
+140 |     n2b_medium.in <== medium;
+141 |     component n2b_big = Num2Bits(k);
+142 |     n2b_big.in <== big;
+143 | 
+144 |     in === small + medium * (1 << n) + big * (1 << n + m);
+145 | }
+146 | 
+147 | // a[i], b[i] in 0... 2**n-1
+148 | // represent a = a[0] + a[1] * 2**n + .. + a[k - 1] * 2**(n * k)
+149 | template BigAdd(n, k) {
+150 |     assert(n <= 252);
+151 |     signal input a[k];
+152 |     signal input b[k];
+153 |     signal output out[k + 1];
+154 | 
+155 |     component unit0 = ModSum(n);
+156 |     unit0.a <== a[0];
+157 |     unit0.b <== b[0];
+158 |     out[0] <== unit0.sum;
+159 | 
+160 |     component unit[k - 1];
+161 |     for (var i = 1; i < k; i++) {
+162 |         unit[i - 1] = ModSumThree(n);
+163 |         unit[i - 1].a <== a[i];
+164 |         unit[i - 1].b <== b[i];
+165 |         if (i == 1) {
+166 |             unit[i - 1].c <== unit0.carry;
+167 |         } else {
+168 |             unit[i - 1].c <== unit[i - 2].carry;
+169 |         }
+170 |         out[i] <== unit[i - 1].sum;
+171 |     }
+172 |     out[k] <== unit[k - 2].carry;
+173 | }
+174 | 
+175 | // a and b have n-bit registers
+176 | // a has ka registers, each with NONNEGATIVE ma-bit values (ma can be > n)
+177 | // b has kb registers, each with NONNEGATIVE mb-bit values (mb can be > n)
+178 | // out has ka + kb - 1 registers, each with (ma + mb + ceil(log(max(ka, kb))))-bit values
+179 | template BigMultNoCarry(n, ma, mb, ka, kb) {
+180 |     assert(ma + mb <= 253);
+181 |     signal input a[ka];
+182 |     signal input b[kb];
+183 |     signal output out[ka + kb - 1];
+184 | 
+185 |     var prod_val[ka + kb - 1];
+186 |     for (var i = 0; i < ka + kb - 1; i++) {
+187 |         prod_val[i] = 0;
+188 |     }
+189 |     for (var i = 0; i < ka; i++) {
+190 |         for (var j = 0; j < kb; j++) {
+191 |             prod_val[i + j] += a[i] * b[j];
+192 |         }
+193 |     }
+194 |     for (var i = 0; i < ka + kb - 1; i++) {
+195 |         out[i] <-- prod_val[i];
+196 |     }
+197 | 
+198 |     var a_poly[ka + kb - 1];
+199 |     var b_poly[ka + kb - 1];
+200 |     var out_poly[ka + kb - 1];
+201 |     for (var i = 0; i < ka + kb - 1; i++) {
+202 |         out_poly[i] = 0;
+203 |         a_poly[i] = 0;
+204 |         b_poly[i] = 0;
+205 |         for (var j = 0; j < ka + kb - 1; j++) {
+206 |             out_poly[i] = out_poly[i] + out[j] * (i ** j);
+207 |         }
+208 |         for (var j = 0; j < ka; j++) {
+209 |             a_poly[i] = a_poly[i] + a[j] * (i ** j);
+210 |         }
+211 |         for (var j = 0; j < kb; j++) {
+212 |             b_poly[i] = b_poly[i] + b[j] * (i ** j);
+213 |         }
+214 |     }
+215 |     for (var i = 0; i < ka + kb - 1; i++) {
+216 |         out_poly[i] === a_poly[i] * b_poly[i];
+217 |     }
+218 | }
+219 | 
+220 | 
+221 | // in[i] contains longs
+222 | // out[i] contains shorts
+223 | template LongToShortNoEndCarry(n, k) {
+224 |     assert(n <= 126);
+225 |     signal input in[k];
+226 |     signal output out[k+1];
+227 | 
+228 |     var split[k][3];
+229 |     for (var i = 0; i < k; i++) {
+230 |         split[i] = SplitThreeFn(in[i], n, n, n);
+231 |     }
+232 | 
+233 |     var carry[k];
+234 |     carry[0] = 0;
+235 |     out[0] <-- split[0][0];
+236 |     if (k == 1) {
+237 | 	out[1] <-- split[0][1];
+238 |     }
+239 |     if (k > 1) {
+240 |         var sumAndCarry[2] = SplitFn(split[0][1] + split[1][0], n, n);
+241 |         out[1] <-- sumAndCarry[0];
+242 |         carry[1] = sumAndCarry[1];
+243 |     }
+244 |     if (k == 2) {
+245 | 	out[2] <-- split[1][1] + split[0][2] + carry[1];
+246 |     }
+247 |     if (k > 2) {
+248 |         for (var i = 2; i < k; i++) {
+249 |             var sumAndCarry[2] = SplitFn(split[i][0] + split[i-1][1] + split[i-2][2] + carry[i-1], n, n);
+250 |             out[i] <-- sumAndCarry[0];
+251 |             carry[i] = sumAndCarry[1];
+252 |         }
+253 |         out[k] <-- split[k-1][1] + split[k-2][2] + carry[k-1];
+254 |     }
+255 | 
+256 |     component outRangeChecks[k+1];
+257 |     for (var i = 0; i < k+1; i++) {
+258 |         outRangeChecks[i] = Num2Bits(n);
+259 |         outRangeChecks[i].in <== out[i];
+260 |     }
+261 | 
+262 |     signal runningCarry[k];
+263 |     component runningCarryRangeChecks[k];
+264 |     runningCarry[0] <-- (in[0] - out[0]) / (1 << n);
+265 |     runningCarryRangeChecks[0] = Num2Bits(n + log_ceil(k));
+266 |     runningCarryRangeChecks[0].in <== runningCarry[0];
+267 |     runningCarry[0] * (1 << n) === in[0] - out[0];
+268 |     for (var i = 1; i < k; i++) {
+269 |         runningCarry[i] <-- (in[i] - out[i] + runningCarry[i-1]) / (1 << n);
+270 |         runningCarryRangeChecks[i] = Num2Bits(n + log_ceil(k));
+271 |         runningCarryRangeChecks[i].in <== runningCarry[i];
+272 |         runningCarry[i] * (1 << n) === in[i] - out[i] + runningCarry[i-1];
+273 |     }
+274 |     runningCarry[k-1] === out[k];
+275 | }
+276 | 
+277 | template BigMult(n, k) {
+278 |     signal input a[k];
+279 |     signal input b[k];
+280 |     signal output out[2 * k];
+281 | 
+282 |     component mult = BigMultNoCarry(n, n, n, k, k);
+283 |     for (var i = 0; i < k; i++) {
+284 |         mult.a[i] <== a[i];
+285 |         mult.b[i] <== b[i];
+286 |     }
+287 | 
+288 |     // no carry is possible in the highest order register
+289 |     component longshort = LongToShortNoEndCarry(n, 2 * k - 1);
+290 |     for (var i = 0; i < 2 * k - 1; i++) {
+291 |         longshort.in[i] <== mult.out[i];
+292 |     }
+293 |     for (var i = 0; i < 2 * k; i++) {
+294 |         out[i] <== longshort.out[i];
+295 |     }
+296 | }
+297 | 
+298 | template BigLessThan(n, k){
+299 |     signal input a[k];
+300 |     signal input b[k];
+301 |     signal output out;
+302 | 
+303 |     component lt[k];
+304 |     component eq[k];
+305 |     for (var i = 0; i < k; i++) {
+306 |         lt[i] = LessThan(n);
+307 |         lt[i].in[0] <== a[i];
+308 |         lt[i].in[1] <== b[i];
+309 |         eq[i] = IsEqual();
+310 |         eq[i].in[0] <== a[i];
+311 |         eq[i].in[1] <== b[i];
+312 |     }
+313 | 
+314 |     // ors[i] holds (lt[k - 1] || (eq[k - 1] && lt[k - 2]) .. || (eq[k - 1] && .. && lt[i]))
+315 |     // ands[i] holds (eq[k - 1] && .. && lt[i])
+316 |     // eq_ands[i] holds (eq[k - 1] && .. && eq[i])
+317 |     component ors[k - 1];
+318 |     component ands[k - 1];
+319 |     component eq_ands[k - 1];
+320 |     for (var i = k - 2; i >= 0; i--) {
+321 |         ands[i] = AND();
+322 |         eq_ands[i] = AND();
+323 |         ors[i] = OR();
+324 | 
+325 |         if (i == k - 2) {
+326 |            ands[i].a <== eq[k - 1].out;
+327 |            ands[i].b <== lt[k - 2].out;
+328 |            eq_ands[i].a <== eq[k - 1].out;
+329 |            eq_ands[i].b <== eq[k - 2].out;
+330 |            ors[i].a <== lt[k - 1].out;
+331 |            ors[i].b <== ands[i].out;
+332 |         } else {
+333 |            ands[i].a <== eq_ands[i + 1].out;
+334 |            ands[i].b <== lt[i].out;
+335 |            eq_ands[i].a <== eq_ands[i + 1].out;
+336 |            eq_ands[i].b <== eq[i].out;
+337 |            ors[i].a <== ors[i + 1].out;
+338 |            ors[i].b <== ands[i].out;
+339 |         }
+340 |      }
+341 |      out <== ors[0].out;
+342 | }
+343 | 
+344 | template BigIsEqual(k){
+345 |     signal input in[2][k];
+346 |     signal output out;
+347 |     component isEqual[k+1];
+348 |     var sum = 0;
+349 |     for(var i = 0; i < k; i++){
+350 |         isEqual[i] = IsEqual();
+351 |         isEqual[i].in[0] <== in[0][i];
+352 |         isEqual[i].in[1] <== in[1][i];
+353 |         sum = sum + isEqual[i].out;
+354 |     }
+355 | 
+356 |     isEqual[k] = IsEqual();
+357 |     isEqual[k].in[0] <== sum;
+358 |     isEqual[k].in[1] <== k;
+359 |     out <== isEqual[k].out;
+360 | }
+361 | 
+362 | // leading register of b should be non-zero
+363 | template BigMod(n, k) {
+364 |     assert(n <= 126);
+365 |     signal input a[2 * k];
+366 |     signal input b[k];
+367 | 
+368 |     signal output div[k + 1];
+369 |     signal output mod[k];
+370 | 
+371 |     var longdiv[2][100] = long_div(n, k, k, a, b);
+372 |     for (var i = 0; i < k; i++) {
+373 |         div[i] <-- longdiv[0][i];
+374 |         mod[i] <-- longdiv[1][i];
+375 |     }
+376 |     div[k] <-- longdiv[0][k];
+377 |     component div_range_checks[k + 1];
+378 |     for (var i = 0; i <= k; i++) {
+379 |         div_range_checks[i] = Num2Bits(n);
+380 |         div_range_checks[i].in <== div[i];
+381 |     }
+382 |     component mod_range_checks[k];
+383 |     for (var i = 0; i < k; i++) {
+384 |         mod_range_checks[i] = Num2Bits(n);
+385 |         mod_range_checks[i].in <== mod[i];
+386 |     }
+387 | 
+388 |     component mul = BigMult(n, k + 1);
+389 |     for (var i = 0; i < k; i++) {
+390 |         mul.a[i] <== div[i];
+391 |         mul.b[i] <== b[i];
+392 |     }
+393 |     mul.a[k] <== div[k];
+394 |     mul.b[k] <== 0;
+395 | 
+396 |     component add = BigAdd(n, 2 * k + 2);
+397 |     for (var i = 0; i < 2 * k; i++) {
+398 |         add.a[i] <== mul.out[i];
+399 |         if (i < k) {
+400 |             add.b[i] <== mod[i];
+401 |         } else {
+402 |             add.b[i] <== 0;
+403 |         }
+404 |     }
+405 |     add.a[2 * k] <== mul.out[2 * k];
+406 |     add.a[2 * k + 1] <== mul.out[2 * k + 1];
+407 |     add.b[2 * k] <== 0;
+408 |     add.b[2 * k + 1] <== 0;
+409 | 
+410 |     for (var i = 0; i < 2 * k; i++) {
+411 |         add.out[i] === a[i];
+412 |     }
+413 |     add.out[2 * k] === 0;
+414 |     add.out[2 * k + 1] === 0;
+415 | 
+416 |     component lt = BigLessThan(n, k);
+417 |     for (var i = 0; i < k; i++) {
+418 |         lt.a[i] <== mod[i];
+419 |         lt.b[i] <== b[i];
+420 |     }
+421 |     lt.out === 1;
+422 | }
+423 | 
+424 | // a[i], b[i] in 0... 2**n-1
+425 | // represent a = a[0] + a[1] * 2**n + .. + a[k - 1] * 2**(n * k)
+426 | // assume a >= b
+427 | template BigSub(n, k) {
+428 |     assert(n <= 252);
+429 |     signal input a[k];
+430 |     signal input b[k];
+431 |     signal output out[k];
+432 |     signal output underflow;
+433 | 
+434 |     component unit0 = ModSub(n);
+435 |     unit0.a <== a[0];
+436 |     unit0.b <== b[0];
+437 |     out[0] <== unit0.out;
+438 | 
+439 |     component unit[k - 1];
+440 |     for (var i = 1; i < k; i++) {
+441 |         unit[i - 1] = ModSubThree(n);
+442 |         unit[i - 1].a <== a[i];
+443 |         unit[i - 1].b <== b[i];
+444 |         if (i == 1) {
+445 |             unit[i - 1].c <== unit0.borrow;
+446 |         } else {
+447 |             unit[i - 1].c <== unit[i - 2].borrow;
+448 |         }
+449 |         out[i] <== unit[i - 1].out;
+450 |     }
+451 |     underflow <== unit[k - 2].borrow;
+452 | }
+453 | 
+454 | // calculates (a - b) % p, where a, b < p
+455 | // note: does not assume a >= b
+456 | template BigSubModP(n, k){
+457 |     assert(n <= 252);
+458 |     signal input a[k];
+459 |     signal input b[k];
+460 |     signal input p[k];
+461 |     signal output out[k];
+462 |     component sub = BigSub(n, k);
+463 |     for (var i = 0; i < k; i++){
+464 |         sub.a[i] <== a[i];
+465 |         sub.b[i] <== b[i];
+466 |     }
+467 |     signal flag;
+468 |     flag <== sub.underflow;
+469 |     component add = BigAdd(n, k);
+470 |     for (var i = 0; i < k; i++){
+471 |         add.a[i] <== sub.out[i];
+472 |         add.b[i] <== flag * p[i];
+473 |     }
+474 |     for (var i = 0; i < k; i++){
+475 |         out[i] <== add.out[i];
+476 |     }
+477 | }
+478 | 
+479 | template BigMultModP(n, k) {
+480 |     assert(n <= 252);
+481 |     signal input a[k];
+482 |     signal input b[k];
+483 |     signal input p[k];
+484 |     signal output out[k];
+485 | 
+486 |     component big_mult = BigMult(n, k);
+487 |     for (var i = 0; i < k; i++) {
+488 |         big_mult.a[i] <== a[i];
+489 |         big_mult.b[i] <== b[i];
+490 |     }
+491 |     component big_mod = BigMod(n, k);
+492 |     for (var i = 0; i < 2 * k; i++) {
+493 |         big_mod.a[i] <== big_mult.out[i];
+494 |     }
+495 |     for (var i = 0; i < k; i++) {
+496 |         big_mod.b[i] <== p[i];
+497 |     }
+498 |     for (var i = 0; i < k; i++) {
+499 |         out[i] <== big_mod.mod[i];
+500 |     }
+501 | }
+502 | 
+503 | template BigModInv(n, k) {
+504 |     assert(n <= 252);
+505 |     signal input in[k];
+506 |     signal input p[k];
+507 |     signal output out[k];
+508 | 
+509 |     // length k
+510 |     var inv[100] = mod_inv(n, k, in, p);
+511 |     for (var i = 0; i < k; i++) {
+512 |         out[i] <-- inv[i];
+513 |     }
+514 |     component range_checks[k];
+515 |     for (var i = 0; i < k; i++) {
+516 |         range_checks[i] = Num2Bits(n);
+517 |         range_checks[i].in <== out[i];
+518 |     }
+519 | 
+520 |     component mult = BigMult(n, k);
+521 |     for (var i = 0; i < k; i++) {
+522 |         mult.a[i] <== in[i];
+523 |         mult.b[i] <== out[i];
+524 |     }
+525 |     component mod = BigMod(n, k);
+526 |     for (var i = 0; i < 2 * k; i++) {
+527 |         mod.a[i] <== mult.out[i];
+528 |     }
+529 |     for (var i = 0; i < k; i++) {
+530 |         mod.b[i] <== p[i];
+531 |     }
+532 |     mod.mod[0] === 1;
+533 |     for (var i = 1; i < k; i++) {
+534 |         mod.mod[i] === 0;
+535 |     }
+536 | }
+537 | 
+538 | // in[i] contains values in the range -2^(m-1) to 2^(m-1)
+539 | // constrain that in[] as a big integer is zero
+540 | // each limbs is n bits
+541 | template CheckCarryToZero(n, m, k) {
+542 |     assert(k >= 2);
+543 | 
+544 |     var EPSILON = 3;
+545 | 
+546 |     assert(m + EPSILON <= 253);
+547 | 
+548 |     signal input in[k];
+549 | 
+550 |     signal carry[k];
+551 |     component carryRangeChecks[k];
+552 |     for (var i = 0; i < k-1; i++){
+553 |         carryRangeChecks[i] = Num2Bits(m + EPSILON - n);
+554 |         if( i == 0 ){
+555 |             carry[i] <-- in[i] / (1<<n);
+556 |             in[i] === carry[i] * (1<<n);
+557 |         }
+558 |         else{
+559 |             carry[i] <-- (in[i]+carry[i-1]) / (1<<n);
+560 |             in[i] + carry[i-1] === carry[i] * (1<<n);
+561 |         }
+562 |         // checking carry is in the range of - 2^(m-n-1+eps), 2^(m+-n-1+eps)
+563 |         carryRangeChecks[i].in <== carry[i] + ( 1<< (m + EPSILON - n - 1));
+564 |     }
+565 |     in[k-1] + carry[k-2] === 0;
+566 | }
+567 | 
+
+
+--------------------------------------------------------------------------------
+/sdk/circomlib/circuits/bigint_func.circom:
+--------------------------------------------------------------------------------
+  1 | pragma circom 2.1.5;
+  2 | 
+  3 | function isNegative(x) {
+  4 |     // half babyjubjub field size
+  5 |     return x > 10944121435919637611123202872628637544274182200208017171849102093287904247808 ? 1 : 0;
+  6 | }
+  7 | 
+  8 | function div_ceil(m, n) {
+  9 |     var ret = 0;
+ 10 |     if (m % n == 0) {
+ 11 |         ret = m \ n;
+ 12 |     } else {
+ 13 |         ret = m \ n + 1;
+ 14 |     }
+ 15 |     return ret;
+ 16 | }
+ 17 | 
+ 18 | function log_ceil(n) {
+ 19 |    var n_temp = n;
+ 20 |    for (var i = 0; i < 254; i++) {
+ 21 |        if (n_temp == 0) {
+ 22 |           return i;
+ 23 |        }
+ 24 |        n_temp = n_temp \ 2;
+ 25 |    }
+ 26 |    return 254;
+ 27 | }
+ 28 | 
+ 29 | function SplitFn(in, n, m) {
+ 30 |     return [in % (1 << n), (in \ (1 << n)) % (1 << m)];
+ 31 | }
+ 32 | 
+ 33 | function SplitThreeFn(in, n, m, k) {
+ 34 |     return [in % (1 << n), (in \ (1 << n)) % (1 << m), (in \ (1 << n + m)) % (1 << k)];
+ 35 | }
+ 36 | 
+ 37 | // m bits per overflowed register (values are potentially negative)
+ 38 | // n bits per properly-sized register
+ 39 | // in has k registers
+ 40 | // out has k + ceil(m/n) - 1 + 1 registers. highest-order potentially negative,
+ 41 | // all others are positive
+ 42 | // - 1 since the last register is included in the last ceil(m/n) array
+ 43 | // + 1 since the carries from previous registers could push you over
+ 44 | function getProperRepresentation(m, n, k, in) {
+ 45 |     var ceilMN = div_ceil(m, n);
+ 46 | 
+ 47 |     var out[100]; // should be out[k + ceilMN]
+ 48 |     assert(k + ceilMN < 100);
+ 49 |     for (var i = 0; i < k; i++) {
+ 50 |         out[i] = in[i];
+ 51 |     }
+ 52 |     for (var i = k; i < 100; i++) {
+ 53 |         out[i] = 0;
+ 54 |     }
+ 55 |     assert(n <= m);
+ 56 |     for (var i = 0; i+1 < k + ceilMN; i++) {
+ 57 |         assert((1 << m) >= out[i] && out[i] >= -(1 << m));
+ 58 |         var shifted_val = out[i] + (1 << m);
+ 59 |         assert(0 <= shifted_val && shifted_val <= (1 << (m+1)));
+ 60 |         out[i] = shifted_val & ((1 << n) - 1);
+ 61 |         out[i+1] += (shifted_val >> n) - (1 << (m - n));
+ 62 |     }
+ 63 | 
+ 64 |     return out;
+ 65 | }
+ 66 | 
+ 67 | // Evaluate polynomial a at point x
+ 68 | function poly_eval(len, a, x) {
+ 69 |     var v = 0;
+ 70 |     for (var i = 0; i < len; i++) {
+ 71 |         v += a[i] * (x ** i);
+ 72 |     }
+ 73 |     return v;
+ 74 | }
+ 75 | 
+ 76 | // Interpolate a degree len-1 polynomial given its evaluations at 0..len-1
+ 77 | function poly_interp(len, v) {
+ 78 |     assert(len <= 200);
+ 79 |     var out[200];
+ 80 |     for (var i = 0; i < len; i++) {
+ 81 |         out[i] = 0;
+ 82 |     }
+ 83 | 
+ 84 |     // Product_{i=0..len-1} (x-i)
+ 85 |     var full_poly[201];
+ 86 |     full_poly[0] = 1;
+ 87 |     for (var i = 0; i < len; i++) {
+ 88 |         full_poly[i+1] = 0;
+ 89 |         for (var j = i; j >= 0; j--) {
+ 90 |             full_poly[j+1] += full_poly[j];
+ 91 |             full_poly[j] *= -i;
+ 92 |         }
+ 93 |     }
+ 94 | 
+ 95 |     for (var i = 0; i < len; i++) {
+ 96 |         var cur_v = 1;
+ 97 |         for (var j = 0; j < len; j++) {
+ 98 |             if (i == j) {
+ 99 |                 // do nothing
+100 |             } else {
+101 |                 cur_v *= i-j;
+102 |             }
+103 |         }
+104 |         cur_v = v[i] / cur_v;
+105 | 
+106 |         var cur_rem = full_poly[len];
+107 |         for (var j = len-1; j >= 0; j--) {
+108 |             out[j] += cur_v * cur_rem;
+109 |             cur_rem = full_poly[j] + i * cur_rem;
+110 |         }
+111 |         assert(cur_rem == 0);
+112 |     }
+113 | 
+114 |     return out;
+115 | }
+116 | 
+117 | // 1 if true, 0 if false
+118 | function long_gt(n, k, a, b) {
+119 |     for (var i = k - 1; i >= 0; i--) {
+120 |         if (a[i] > b[i]) {
+121 |             return 1;
+122 |         }
+123 |         if (a[i] < b[i]) {
+124 |             return 0;
+125 |         }
+126 |     }
+127 |     return 0;
+128 | }
+129 | 
+130 | // n bits per register
+131 | // a has k registers
+132 | // b has k registers
+133 | // a >= b
+134 | function long_sub(n, k, a, b) {
+135 |     var diff[100];
+136 |     var borrow[100];
+137 |     for (var i = 0; i < k; i++) {
+138 |         if (i == 0) {
+139 |            if (a[i] >= b[i]) {
+140 |                diff[i] = a[i] - b[i];
+141 |                borrow[i] = 0;
+142 |             } else {
+143 |                diff[i] = a[i] - b[i] + (1 << n);
+144 |                borrow[i] = 1;
+145 |             }
+146 |         } else {
+147 |             if (a[i] >= b[i] + borrow[i - 1]) {
+148 |                diff[i] = a[i] - b[i] - borrow[i - 1];
+149 |                borrow[i] = 0;
+150 |             } else {
+151 |                diff[i] = (1 << n) + a[i] - b[i] - borrow[i - 1];
+152 |                borrow[i] = 1;
+153 |             }
+154 |         }
+155 |     }
+156 |     return diff;
+157 | }
+158 | 
+159 | // a is a n-bit scalar
+160 | // b has k registers
+161 | function long_scalar_mult(n, k, a, b) {
+162 |     var out[100];
+163 |     for (var i = 0; i < 100; i++) {
+164 |         out[i] = 0;
+165 |     }
+166 |     for (var i = 0; i < k; i++) {
+167 |         var temp = out[i] + (a * b[i]);
+168 |         out[i] = temp % (1 << n);
+169 |         out[i + 1] = out[i + 1] + temp \ (1 << n);
+170 |     }
+171 |     return out;
+172 | }
+173 | 
+174 | 
+175 | // n bits per register
+176 | // a has k + m registers
+177 | // b has k registers
+178 | // out[0] has length m + 1 -- quotient
+179 | // out[1] has length k -- remainder
+180 | // implements algorithm of https://people.eecs.berkeley.edu/~fateman/282/F%20Wright%20notes/week4.pdf
+181 | function long_div(n, k, m, a, b){
+182 |     var out[2][100];
+183 |     m += k;
+184 |     while (b[k-1] == 0) {
+185 |         out[1][k] = 0;
+186 |         k--;
+187 |         assert(k > 0);
+188 |     }
+189 |     m -= k;
+190 | 
+191 |     var remainder[200];
+192 |     for (var i = 0; i < m + k; i++) {
+193 |         remainder[i] = a[i];
+194 |     }
+195 | 
+196 |     var mult[200];
+197 |     var dividend[200];
+198 |     for (var i = m; i >= 0; i--) {
+199 |         if (i == m) {
+200 |             dividend[k] = 0;
+201 |             for (var j = k - 1; j >= 0; j--) {
+202 |                 dividend[j] = remainder[j + m];
+203 |             }
+204 |         } else {
+205 |             for (var j = k; j >= 0; j--) {
+206 |                 dividend[j] = remainder[j + i];
+207 |             }
+208 |         }
+209 | 
+210 |         out[0][i] = short_div(n, k, dividend, b);
+211 | 
+212 |         var mult_shift[100] = long_scalar_mult(n, k, out[0][i], b);
+213 |         var subtrahend[200];
+214 |         for (var j = 0; j < m + k; j++) {
+215 |             subtrahend[j] = 0;
+216 |         }
+217 |         for (var j = 0; j <= k; j++) {
+218 |             if (i + j < m + k) {
+219 |                subtrahend[i + j] = mult_shift[j];
+220 |             }
+221 |         }
+222 |         remainder = long_sub(n, m + k, remainder, subtrahend);
+223 |     }
+224 |     for (var i = 0; i < k; i++) {
+225 |         out[1][i] = remainder[i];
+226 |     }
+227 |     out[1][k] = 0;
+228 | 
+229 |     return out;
+230 | }
+231 | 
+232 | // n bits per register
+233 | // a has k + 1 registers
+234 | // b has k registers
+235 | // assumes leading digit of b is at least 2 ** (n - 1)
+236 | // 0 <= a < (2**n) * b
+237 | function short_div_norm(n, k, a, b) {
+238 |    var qhat = (a[k] * (1 << n) + a[k - 1]) \ b[k - 1];
+239 |    if (qhat > (1 << n) - 1) {
+240 |       qhat = (1 << n) - 1;
+241 |    }
+242 | 
+243 |    var mult[100] = long_scalar_mult(n, k, qhat, b);
+244 |    if (long_gt(n, k + 1, mult, a) == 1) {
+245 |       mult = long_sub(n, k + 1, mult, b);
+246 |       if (long_gt(n, k + 1, mult, a) == 1) {
+247 |          return qhat - 2;
+248 |       } else {
+249 |          return qhat - 1;
+250 |       }
+251 |    } else {
+252 |        return qhat;
+253 |    }
+254 | }
+255 | 
+256 | // n bits per register
+257 | // a has k + 1 registers
+258 | // b has k registers
+259 | // assumes leading digit of b is non-zero
+260 | // 0 <= a < (2**n) * b
+261 | function short_div(n, k, a, b) {
+262 |    var scale = (1 << n) \ (1 + b[k - 1]);
+263 | 
+264 |    // k + 2 registers now
+265 |    var norm_a[200] = long_scalar_mult(n, k + 1, scale, a);
+266 |    // k + 1 registers now
+267 |    var norm_b[200] = long_scalar_mult(n, k, scale, b);
+268 | 
+269 |    var ret;
+270 |    if (norm_b[k] != 0) {
+271 |        ret = short_div_norm(n, k + 1, norm_a, norm_b);
+272 |    } else {
+273 |        ret = short_div_norm(n, k, norm_a, norm_b);
+274 |    }
+275 |    return ret;
+276 | }
+277 | 
+278 | // n bits per register
+279 | // a and b both have k registers
+280 | // out[0] has length 2 * k
+281 | // adapted from BigMulShortLong and LongToShortNoEndCarry2 witness computation
+282 | function prod(n, k, a, b) {
+283 |     // first compute the intermediate values. taken from BigMulShortLong
+284 |     var prod_val[100]; // length is 2 * k - 1
+285 |     for (var i = 0; i < 2 * k - 1; i++) {
+286 |         prod_val[i] = 0;
+287 |         if (i < k) {
+288 |             for (var a_idx = 0; a_idx <= i; a_idx++) {
+289 |                 prod_val[i] = prod_val[i] + a[a_idx] * b[i - a_idx];
+290 |             }
+291 |         } else {
+292 |             for (var a_idx = i - k + 1; a_idx < k; a_idx++) {
+293 |                 prod_val[i] = prod_val[i] + a[a_idx] * b[i - a_idx];
+294 |             }
+295 |         }
+296 |     }
+297 | 
+298 |     // now do a bunch of carrying to make sure registers not overflowed. taken from LongToShortNoEndCarry2
+299 |     var out[100]; // length is 2 * k
+300 | 
+301 |     var split[100][3]; // first dimension has length 2 * k - 1
+302 |     for (var i = 0; i < 2 * k - 1; i++) {
+303 |         split[i] = SplitThreeFn(prod_val[i], n, n, n);
+304 |     }
+305 | 
+306 |     var carry[100]; // length is 2 * k - 1
+307 |     carry[0] = 0;
+308 |     out[0] = split[0][0];
+309 |     if (2 * k - 1 > 1) {
+310 |         var sumAndCarry[2] = SplitFn(split[0][1] + split[1][0], n, n);
+311 |         out[1] = sumAndCarry[0];
+312 |         carry[1] = sumAndCarry[1];
+313 |     }
+314 |     if (2 * k - 1 > 2) {
+315 |         for (var i = 2; i < 2 * k - 1; i++) {
+316 |             var sumAndCarry[2] = SplitFn(split[i][0] + split[i-1][1] + split[i-2][2] + carry[i-1], n, n);
+317 |             out[i] = sumAndCarry[0];
+318 |             carry[i] = sumAndCarry[1];
+319 |         }
+320 |         out[2 * k - 1] = split[2*k-2][1] + split[2*k-3][2] + carry[2*k-2];
+321 |     }
+322 |     return out;
+323 | }
+324 | 
+325 | // n bits per register
+326 | // a has k registers
+327 | // p has k registers
+328 | // e has k registers
+329 | // k * n <= 500
+330 | // p is a prime
+331 | // computes a^e mod p
+332 | function mod_exp(n, k, a, p, e) {
+333 |     var eBits[500]; // length is k * n
+334 |     for (var i = 0; i < k; i++) {
+335 |         for (var j = 0; j < n; j++) {
+336 |             eBits[j + n * i] = (e[i] >> j) & 1;
+337 |         }
+338 |     }
+339 | 
+340 |     var out[100]; // length is k
+341 |     for (var i = 0; i < 100; i++) {
+342 |         out[i] = 0;
+343 |     }
+344 |     out[0] = 1;
+345 | 
+346 |     // repeated squaring
+347 |     for (var i = k * n - 1; i >= 0; i--) {
+348 |         // multiply by a if bit is 0
+349 |         if (eBits[i] == 1) {
+350 |             var temp[200]; // length 2 * k
+351 |             temp = prod(n, k, out, a);
+352 |             var temp2[2][100];
+353 |             temp2 = long_div(n, k, k, temp, p);
+354 |             out = temp2[1];
+355 |         }
+356 | 
+357 |         // square, unless we're at the end
+358 |         if (i > 0) {
+359 |             var temp[200]; // length 2 * k
+360 |             temp = prod(n, k, out, out);
+361 |             var temp2[2][100];
+362 |             temp2 = long_div(n, k, k, temp, p);
+363 |             out = temp2[1];
+364 |         }
+365 | 
+366 |     }
+367 |     return out;
+368 | }
+369 | 
+370 | // n bits per register
+371 | // a has k registers
+372 | // p has k registers
+373 | // k * n <= 500
+374 | // p is a prime
+375 | // if a == 0 mod p, returns 0
+376 | // else computes inv = a^(p-2) mod p
+377 | function mod_inv(n, k, a, p) {
+378 |     var isZero = 1;
+379 |     for (var i = 0; i < k; i++) {
+380 |         if (a[i] != 0) {
+381 |             isZero = 0;
+382 |         }
+383 |     }
+384 |     if (isZero == 1) {
+385 |         var ret[100];
+386 |         for (var i = 0; i < k; i++) {
+387 |             ret[i] = 0;
+388 |         }
+389 |         return ret;
+390 |     }
+391 | 
+392 |     var pCopy[100];
+393 |     for (var i = 0; i < 100; i++) {
+394 |         if (i < k) {
+395 |             pCopy[i] = p[i];
+396 |         } else {
+397 |             pCopy[i] = 0;
+398 |         }
+399 |     }
+400 | 
+401 |     var two[100];
+402 |     for (var i = 0; i < 100; i++) {
+403 |         two[i] = 0;
+404 |     }
+405 |     two[0] = 2;
+406 | 
+407 |     var pMinusTwo[100];
+408 |     pMinusTwo = long_sub(n, k, pCopy, two); // length k
+409 |     var out[100];
+410 |     out = mod_exp(n, k, a, pCopy, pMinusTwo);
+411 |     return out;
+412 | }
+413 | 
+414 | // a, b and out are all n bits k registers
+415 | function long_sub_mod_p(n, k, a, b, p){
+416 |     var gt = long_gt(n, k, a, b);
+417 |     var tmp[100];
+418 |     if(gt){
+419 |         tmp = long_sub(n, k, a, b);
+420 |     }
+421 |     else{
+422 |         tmp = long_sub(n, k, b, a);
+423 |     }
+424 |     var out[2][100];
+425 |     for(var i = k;i < 2 * k; i++){
+426 |         tmp[i] = 0;
+427 |     }
+428 |     out = long_div(n, k, k, tmp, p);
+429 |     if(gt==0){
+430 |         tmp = long_sub(n, k, p, out[1]);
+431 |     }
+432 |     return tmp;
+433 | }
+434 | 
+435 | // a, b, p and out are all n bits k registers
+436 | function prod_mod_p(n, k, a, b, p){
+437 |     var tmp[100];
+438 |     var result[2][100];
+439 |     tmp = prod(n, k, a, b);
+440 |     result = long_div(n, k, k, tmp, p);
+441 |     return result[1];
+442 | }
+443 | 
+
+
+--------------------------------------------------------------------------------
+/sdk/circomlib/circuits/fp.circom:
+--------------------------------------------------------------------------------
+  1 | pragma circom 2.1.5;
+  2 | 
+  3 | include "circomlib/circuits/bitify.circom";
+  4 | include "circomlib/circuits/comparators.circom";
+  5 | include "circomlib/circuits/sign.circom";
+  6 | include "./bigint.circom";
+  7 | include "./bigint_func.circom";
+  8 | 
+  9 | // These functions operate over values in Z/Zp for some integer p (typically,
+ 10 | // but not necessarily prime). Values are stored as standard bignums with k
+ 11 | // chunks of n bits, but intermediate values often have "overflow" bits inside
+ 12 | // various chunks.
+ 13 | //
+ 14 | // These Fp functions will always correctly generate witnesses mod p, but they
+ 15 | // do not *check* that values are normalized to < p; they only check that
+ 16 | // values are correct mod p. This is to save the comparison circuit.
+ 17 | // They *will* always check for intended results mod p (soundness), but it may
+ 18 | // not have a unique intermediate signal.
+ 19 | //
+ 20 | // Conversely, some templates may not be satisfiable if the input witnesses are
+ 21 | // not < p. This does not break completeness, as honest provers will always
+ 22 | // generate witnesses which are canonical (between 0 and p).
+ 23 | 
+ 24 | // a * b = r mod p
+ 25 | // a * b - p * q - r for some q
+ 26 | template FpMul(n, k) {
+ 27 |     assert(n + n + log_ceil(k) + 2 <= 252);
+ 28 |     signal input a[k];
+ 29 |     signal input b[k];
+ 30 |     signal input p[k];
+ 31 | 
+ 32 |     signal output out[k];
+ 33 | 
+ 34 |     signal v_ab[2*k-1];
+ 35 |     for (var x = 0; x < 2*k-1; x++) {
+ 36 |         var v_a = poly_eval(k, a, x);
+ 37 |         var v_b = poly_eval(k, b, x);
+ 38 |         v_ab[x] <== v_a * v_b;
+ 39 |     }
+ 40 | 
+ 41 |     var ab[200] = poly_interp(2*k-1, v_ab);
+ 42 |     // ab_proper has length 2*k
+ 43 |     var ab_proper[200] = getProperRepresentation(n + n + log_ceil(k), n, 2*k-1, ab);
+ 44 | 
+ 45 |     var long_div_out[2][100] = long_div(n, k, k, ab_proper, p);
+ 46 | 
+ 47 |     // Since we're only computing a*b, we know that q < p will suffice, so we
+ 48 |     // know it fits into k chunks and can do size n range checks.
+ 49 |     signal q[k];
+ 50 |     component q_range_check[k];
+ 51 |     signal r[k];
+ 52 |     component r_range_check[k];
+ 53 |     for (var i = 0; i < k; i++) {
+ 54 |         q[i] <-- long_div_out[0][i];
+ 55 |         q_range_check[i] = Num2Bits(n);
+ 56 |         q_range_check[i].in <== q[i];
+ 57 | 
+ 58 |         r[i] <-- long_div_out[1][i];
+ 59 |         r_range_check[i] = Num2Bits(n);
+ 60 |         r_range_check[i].in <== r[i];
+ 61 |     }
+ 62 | 
+ 63 |     signal v_pq_r[2*k-1];
+ 64 |     for (var x = 0; x < 2*k-1; x++) {
+ 65 |         var v_p = poly_eval(k, p, x);
+ 66 |         var v_q = poly_eval(k, q, x);
+ 67 |         var v_r = poly_eval(k, r, x);
+ 68 |         v_pq_r[x] <== v_p * v_q + v_r;
+ 69 |     }
+ 70 | 
+ 71 |     signal v_t[2*k-1];
+ 72 |     for (var x = 0; x < 2*k-1; x++) {
+ 73 |         v_t[x] <== v_ab[x] - v_pq_r[x];
+ 74 |     }
+ 75 | 
+ 76 |     var t[200] = poly_interp(2*k-1, v_t);
+ 77 |     component tCheck = CheckCarryToZero(n, n + n + log_ceil(k) + 2, 2*k-1);
+ 78 |     for (var i = 0; i < 2*k-1; i++) {
+ 79 |         tCheck.in[i] <== t[i];
+ 80 |     }
+ 81 | 
+ 82 |     for (var i = 0; i < k; i++) {
+ 83 |         out[i] <== r[i];
+ 84 |     }
+ 85 | }
+ 86 | 
+ 87 | // Lifted from https://sourcegraph.com/github.com/darkforest-eth/circuits/-/blob/range_proof/circuit.circom
+ 88 | // NB: RangeProof is inclusive.
+ 89 | // input: field element, whose abs is claimed to be less than max_abs_value
+ 90 | // output: none
+ 91 | // we also want something like 4 * (abs(in) + max_abs_value) < 2 ** bits
+ 92 | // and bits << 256
+ 93 | // NB: RangeProof is inclusive.
+ 94 | // input: field element, whose abs is claimed to be <= than max_abs_value
+ 95 | // output: none
+ 96 | // also checks that both max and abs(in) are expressible in `bits` bits
+ 97 | template RangeProof(bits) {
+ 98 |     signal input in;
+ 99 |     signal input max_abs_value;
+100 | 
+101 |     /* check that both max and abs(in) are expressible in `bits` bits  */
+102 |     component n2b1 = Num2Bits(bits+1);
+103 |     n2b1.in <== in + (1 << bits);
+104 |     component n2b2 = Num2Bits(bits);
+105 |     n2b2.in <== max_abs_value;
+106 | 
+107 |     /* check that in + max is between 0 and 2*max */
+108 |     component lowerBound = LessThan(bits+1);
+109 |     component upperBound = LessThan(bits+1);
+110 | 
+111 |     lowerBound.in[0] <== max_abs_value + in;
+112 |     lowerBound.in[1] <== 0;
+113 |     lowerBound.out === 0;
+114 | 
+115 |     upperBound.in[0] <== 2 * max_abs_value;
+116 |     upperBound.in[1] <== max_abs_value + in;
+117 |     upperBound.out === 0;
+118 | }
+119 | 
+120 | // input: n field elements, whose abs are claimed to be less than max_abs_value
+121 | // output: none
+122 | template MultiRangeProof(n, bits) {
+123 |     signal input in[n];
+124 |     signal input max_abs_value;
+125 |     component rangeProofs[n];
+126 | 
+127 |     for (var i = 0; i < n; i++) {
+128 |         rangeProofs[i] = RangeProof(bits);
+129 |         rangeProofs[i].in <== in[i];
+130 |         rangeProofs[i].max_abs_value <== max_abs_value;
+131 |     }
+132 | }
+133 | 
+134 | template IsNegative(){
+135 |     signal input in;
+136 |     signal output out;
+137 |     component n2b = Num2Bits(254);
+138 |     component sign = Sign();
+139 |     in ==> n2b.in;
+140 |     for (var i = 0; i<254; i++) {
+141 |         n2b.out[i] ==> sign.in[i];
+142 |     }
+143 |     sign.sign ==> out;
+144 | }
+145 | 
+
+
+--------------------------------------------------------------------------------
+/sdk/circomlib/circuits/jwt.circom:
+--------------------------------------------------------------------------------
+ 1 | pragma circom 2.1.5;
+ 2 | 
+ 3 | include "./string.circom";
+ 4 | include "./sha256.circom";
+ 5 | include "./rsa.circom";
+ 6 | 
+ 7 | template JWTSplit(max_bytes) {
+ 8 |   signal input jwt[max_bytes];
+ 9 |   signal output header[max_bytes];
+10 |   signal output payload[max_bytes];
+11 |   signal output signature[max_bytes];
+12 | 
+13 |   // split JWT 
+14 |   component splitedJWT = SplitBy(max_bytes, 46, 3); // 46 is '.'
+15 | 
+16 |   splitedJWT.text <== jwt;
+17 |   header <== splitedJWT.out[0];
+18 |   payload <== splitedJWT.out[1];
+19 |   signature <== splitedJWT.out[2];
+20 | }
+21 | 
+22 | template JWTVerify(max_bytes, n, k) {
+23 |   assert(n * k > 2048); // constraints for 2048 bit RSA
+24 |   assert(n < (255 \ 2)); // we want a multiplication to fit into a circom signal
+25 | 
+26 |   signal input jwt[max_bytes];
+27 |   signal input signature[k];
+28 |   signal input pubkey[k];
+29 | 
+30 |   // JWT hash
+31 |   signal output sha[256] <== Sha256String(max_bytes)(jwt);
+32 | 
+33 |   var msg_len = (256 + n) \ n;
+34 | 
+35 |   component base_msg[msg_len];
+36 |   for (var i = 0; i < msg_len; i++) {
+37 |       base_msg[i] = Bits2Num(n);
+38 |   }
+39 |   for (var i = 0; i < 256; i++) {
+40 |       base_msg[i \ n].in[i % n] <== sha[255 - i];
+41 |   }
+42 |   for (var i = 256; i < n * msg_len; i++) {
+43 |       base_msg[i \ n].in[i % n] <== 0;
+44 |   }
+45 | 
+46 |   // Verify RSA signature
+47 |   component rsa = RSAVerify65537(n, k);
+48 |   for (var i = 0; i < msg_len; i++) {
+49 |       rsa.base_message[i] <== base_msg[i].out;
+50 |   }
+51 |   for (var i = msg_len; i < k; i++) {
+52 |       rsa.base_message[i] <== 0;
+53 |   }
+54 | 
+55 |   rsa.signature <== signature;
+56 |   rsa.modulus <== pubkey;
+57 | }
+58 | 
+59 | 
+
+
+--------------------------------------------------------------------------------
+/sdk/circomlib/circuits/rsa.circom:
+--------------------------------------------------------------------------------
+  1 | pragma circom 2.1.5;
+  2 | 
+  3 | include "./fp.circom";
+  4 | 
+  5 | // Computes base^65537 mod modulus
+  6 | // Does not necessarily reduce fully mod modulus (the answer could be
+  7 | // too big by a multiple of modulus)
+  8 | template FpPow65537Mod(n, k) {
+  9 |     signal input base[k];
+ 10 |     // Exponent is hardcoded at 65537
+ 11 |     signal input modulus[k];
+ 12 |     signal output out[k];
+ 13 | 
+ 14 |     component doublers[16];
+ 15 |     component adder = FpMul(n, k);
+ 16 |     for (var i = 0; i < 16; i++) {
+ 17 |         doublers[i] = FpMul(n, k);
+ 18 |     }
+ 19 | 
+ 20 |     for (var j = 0; j < k; j++) {
+ 21 |         adder.p[j] <== modulus[j];
+ 22 |         for (var i = 0; i < 16; i++) {
+ 23 |             doublers[i].p[j] <== modulus[j];
+ 24 |         }
+ 25 |     }
+ 26 |     for (var j = 0; j < k; j++) {
+ 27 |         doublers[0].a[j] <== base[j];
+ 28 |         doublers[0].b[j] <== base[j];
+ 29 |     }
+ 30 |     for (var i = 0; i + 1 < 16; i++) {
+ 31 |         for (var j = 0; j < k; j++) {
+ 32 |             doublers[i + 1].a[j] <== doublers[i].out[j];
+ 33 |             doublers[i + 1].b[j] <== doublers[i].out[j];
+ 34 |         }
+ 35 |     }
+ 36 |     for (var j = 0; j < k; j++) {
+ 37 |         adder.a[j] <== base[j];
+ 38 |         adder.b[j] <== doublers[15].out[j];
+ 39 |     }
+ 40 |     for (var j = 0; j < k; j++) {
+ 41 |         out[j] <== adder.out[j];
+ 42 |     }
+ 43 | }
+ 44 | 
+ 45 | template RSAPad(n, k) {
+ 46 |     signal input modulus[k];
+ 47 |     signal input base_message[k];
+ 48 |     signal output padded_message[k];
+ 49 | 
+ 50 |     var base_len = 408;
+ 51 |     var msg_len = 256;
+ 52 | 
+ 53 |     signal padded_message_bits[n*k];
+ 54 | 
+ 55 |     component modulus_n2b[k];
+ 56 |     component base_message_n2b[k];
+ 57 |     signal modulus_bits[n*k];
+ 58 |     signal base_message_bits[n*k];
+ 59 |     for (var i = 0; i < k; i++) {
+ 60 |         base_message_n2b[i] = Num2Bits(n);
+ 61 |         base_message_n2b[i].in <== base_message[i];
+ 62 |         for (var j = 0; j < n; j++) {
+ 63 |             base_message_bits[i*n+j] <== base_message_n2b[i].out[j];
+ 64 |         }
+ 65 |         modulus_n2b[i] = Num2Bits(n);
+ 66 |         modulus_n2b[i].in <== modulus[i];
+ 67 |         for (var j = 0; j < n; j++) {
+ 68 |             modulus_bits[i*n+j] <== modulus_n2b[i].out[j];
+ 69 |         }
+ 70 |     }
+ 71 | 
+ 72 |     for (var i = msg_len; i < n*k; i++) {
+ 73 |         base_message_bits[i] === 0;
+ 74 |     }
+ 75 | 
+ 76 |     for (var i = 0; i < msg_len; i++) {
+ 77 |         padded_message_bits[i] <== base_message_bits[i];
+ 78 |     }
+ 79 | 
+ 80 |     for (var i = base_len; i < base_len + 8; i++) {
+ 81 |         padded_message_bits[i] <== 0;
+ 82 |     }
+ 83 | 
+ 84 |     for (var i = msg_len; i < base_len; i++) {
+ 85 |         padded_message_bits[i] <== (0x3031300d060960864801650304020105000420 >> (i - msg_len)) & 1;
+ 86 |     }
+ 87 | 
+ 88 |     component modulus_zero[(n*k + 7 - (base_len + 8))\8];
+ 89 |     {
+ 90 |         var modulus_prefix = 0;
+ 91 |         for (var i = n*k - 1; i >= base_len + 8; i--) {
+ 92 |             if (i+8 < n*k) {
+ 93 |                 modulus_prefix += modulus_bits[i+8];
+ 94 |                 if (i % 8 == 0) {
+ 95 |                     var idx = (i - (base_len + 8)) \ 8;
+ 96 |                     modulus_zero[idx] = IsZero();
+ 97 |                     modulus_zero[idx].in <== modulus_prefix;
+ 98 |                     padded_message_bits[i] <== 1-modulus_zero[idx].out;
+ 99 |                 } else {
+100 |                     padded_message_bits[i] <== padded_message_bits[i+1];
+101 |                 }
+102 |             } else {
+103 |                 padded_message_bits[i] <== 0;
+104 |             }
+105 |         }
+106 |     }
+107 | 
+108 |     // The RFC guarantees at least 8 octets of 0xff padding.
+109 |     assert(base_len + 8 + 65 <= n*k);
+110 |     for (var i = base_len + 8; i < base_len + 8 + 65; i++) {
+111 |         padded_message_bits[i] === 1;
+112 |     }
+113 | 
+114 |     component padded_message_b2n[k];
+115 |     for (var i = 0; i < k; i++) {
+116 |         padded_message_b2n[i] = Bits2Num(n);
+117 |         for (var j = 0; j < n; j++) {
+118 |             padded_message_b2n[i].in[j] <== padded_message_bits[i*n+j];
+119 |         }
+120 |         padded_message[i] <== padded_message_b2n[i].out;
+121 |     }
+122 | }
+123 | 
+124 | template RSAVerify65537(n, k) {
+125 |     signal input signature[k];
+126 |     signal input modulus[k];
+127 |     signal input base_message[k];
+128 | 
+129 |     component padder = RSAPad(n, k);
+130 |     for (var i = 0; i < k; i++) {
+131 |         padder.modulus[i] <== modulus[i];
+132 |         padder.base_message[i] <== base_message[i];
+133 |     }
+134 | 
+135 |     // Check that the signature is in proper form and reduced mod modulus.
+136 |     component signatureRangeCheck[k];
+137 |     component bigLessThan = BigLessThan(n, k);
+138 |     for (var i = 0; i < k; i++) {
+139 |         signatureRangeCheck[i] = Num2Bits(n);
+140 |         signatureRangeCheck[i].in <== signature[i];
+141 |         bigLessThan.a[i] <== signature[i];
+142 |         bigLessThan.b[i] <== modulus[i];
+143 |     }
+144 |     bigLessThan.out === 1;
+145 | 
+146 |     component bigPow = FpPow65537Mod(n, k);
+147 |     for (var i = 0; i < k; i++) {
+148 |         bigPow.base[i] <== signature[i];
+149 |         bigPow.modulus[i] <== modulus[i];
+150 |     }
+151 |     // By construction of the padding, the padded message is necessarily
+152 |     // smaller than the modulus. Thus, we don't have to check that bigPow is fully reduced.
+153 |     for (var i = 0; i < k; i++) {
+154 |         bigPow.out[i] === padder.padded_message[i];
+155 |     }
+156 | }
+157 | 
+
+
+--------------------------------------------------------------------------------
+/sdk/circomlib/circuits/sha256.circom:
+--------------------------------------------------------------------------------
+ 1 | pragma circom 2.1.5;
+ 2 | 
+ 3 | include "circomlib/circuits/bitify.circom";
+ 4 | include "./utils.circom";
+ 5 | include "./string.circom";
+ 6 | include "./sha256general.circom";
+ 7 | include "./sha256partial.circom";
+ 8 | 
+ 9 | template Sha256Bytes(max_num_bytes) {
+10 |     signal input in_padded[max_num_bytes];
+11 |     signal input in_len_padded_bytes;
+12 |     signal output out[256];
+13 | 
+14 |     var num_bits = max_num_bytes * 8;
+15 |     component sha = Sha256General(num_bits);
+16 | 
+17 |     component bytes[max_num_bytes];
+18 |     for (var i = 0; i < max_num_bytes; i++) {
+19 |         bytes[i] = Num2Bits(8);
+20 |         bytes[i].in <== in_padded[i];
+21 |         for (var j = 0; j < 8; j++) {
+22 |             sha.paddedIn[i*8+j] <== bytes[i].out[7-j];
+23 |         }
+24 |     }
+25 |     sha.in_len_padded_bits <== in_len_padded_bytes * 8;
+26 | 
+27 |     for (var i = 0; i < 256; i++) {
+28 |         out[i] <== sha.out[i];
+29 |     }
+30 | }
+31 | 
+32 | template Sha256Pad(max_bytes) {
+33 |     signal input text[max_bytes];
+34 |     signal output padded_text[max_bytes];
+35 |     signal output padded_len;
+36 | 
+37 |     // text length
+38 |     component len = Len(max_bytes);
+39 |     len.text <== text;
+40 | 
+41 |     // len.length + 1 bytes + 8 bytes length < max_bytes
+42 |     assert(len.length + 9 < max_bytes);
+43 | 
+44 |     padded_len <-- (len.length + 9) + (64 - (len.length + 9) % 64);
+45 |     assert(padded_len % 64 == 0);
+46 | 
+47 |     component len2bytes = Packed2BytesBigEndian(8);
+48 |     len2bytes.in <== len.length * 8;
+49 | 
+50 |     for (var i = 0; i < max_bytes; i++) {
+51 |         padded_text[i] <-- i < len.length ? text[i] : (i == len.length ? (1 << 7) : (i < padded_len ? (i % 64 < 56 ? 0 : (i % 64 > 56 ? len2bytes.out[(i % 64 - 56)]: 0)) : 0)); // Add the 1 on the end and text length
+52 |     }
+53 | }
+54 | 
+55 | template Sha256String(max_bytes) {
+56 |     signal input text[max_bytes];
+57 |     signal output sha[256];
+58 | 
+59 |     // text pad
+60 |     component sha256Pad = Sha256Pad(max_bytes);
+61 |     sha256Pad.text <== text;
+62 | 
+63 |     sha <== Sha256Bytes(max_bytes)(sha256Pad.padded_text, sha256Pad.padded_len);
+64 | }
+65 | 
+
+
+--------------------------------------------------------------------------------
+/sdk/circomlib/circuits/sha256general.circom:
+--------------------------------------------------------------------------------
+  1 | pragma circom 2.1.5;
+  2 | 
+  3 | include "circomlib/circuits/sha256/constants.circom";
+  4 | include "circomlib/circuits/sha256/sha256compression.circom";
+  5 | include "circomlib/circuits/comparators.circom";
+  6 | include "./utils.circom";
+  7 | 
+  8 | include "circomlib/circuits/bitify.circom"; // needed for Num2Bits
+  9 | 
+ 10 | // A modified version of the SHA256 circuit that allows specified length messages up to a max to all work via array indexing on the SHA256 compression circuit.
+ 11 | template Sha256General(maxBitsPadded) {
+ 12 |     // maxBitsPadded must be a multiple of 512, and the bit circuits in this file are limited to 15 so must be raised if the message is longer.
+ 13 |     assert(maxBitsPadded % 512 == 0);
+ 14 |     var maxBitsPaddedBits = log2_ceil(maxBitsPadded);
+ 15 |     assert(2 ** maxBitsPaddedBits > maxBitsPadded);
+ 16 | 
+ 17 |     // Note that maxBitsPadded = maxBits + 64
+ 18 |     signal input paddedIn[maxBitsPadded];
+ 19 |     signal output out[256];
+ 20 |     signal input in_len_padded_bits; // This is the padded length of the message pre-hash.
+ 21 |     signal inBlockIndex;
+ 22 | 
+ 23 |     var i;
+ 24 |     var k;
+ 25 |     var j;
+ 26 |     var maxBlocks;
+ 27 |     var bitsLastBlock;
+ 28 |     maxBlocks = (maxBitsPadded\512);
+ 29 |     var maxBlocksBits = log2_ceil(maxBlocks);
+ 30 |     assert(2 ** maxBlocksBits > maxBlocks);
+ 31 | 
+ 32 |     inBlockIndex <-- (in_len_padded_bits >> 9);
+ 33 |     in_len_padded_bits === inBlockIndex * 512;
+ 34 | 
+ 35 |     // These verify the unconstrained floor calculation is the uniquely correct integer that represents the floor
+ 36 |     // component floorVerifierUnder = LessEqThan(maxBitsPaddedBits); // todo verify the length passed in is less than nbits. note that maxBitsPaddedBits can likely be lowered or made it a fn of maxbits
+ 37 |     // floorVerifierUnder.in[0] <== (inBlockIndex)*512;
+ 38 |     // floorVerifierUnder.in[1] <== in_len_padded_bits;
+ 39 |     // floorVerifierUnder.out === 1;
+ 40 | 
+ 41 |     // component floorVerifierOver = GreaterThan(maxBitsPaddedBits);
+ 42 |     // floorVerifierOver.in[0] <== (inBlockIndex+1)*512;
+ 43 |     // floorVerifierOver.in[1] <== in_len_padded_bits;
+ 44 |     // floorVerifierOver.out === 1;
+ 45 | 
+ 46 |     // range check for LessEqThan and QuinSelector:
+ 47 |     // constraining in_len_padded_bits to be less than 2^maxBitsPaddedBits
+ 48 |     component lenBits = Num2Bits(maxBitsPaddedBits);
+ 49 |     lenBits.in <== in_len_padded_bits;
+ 50 | 
+ 51 |     // These verify we pass in a valid number of bits to the SHA256 compression circuit.
+ 52 |     component bitLengthVerifier = LessEqThan(maxBitsPaddedBits); // todo verify the length passed in is less than nbits. note that maxBitsPaddedBits can likely be lowered or made it a fn of maxbits
+ 53 |     bitLengthVerifier.in[0] <== in_len_padded_bits;
+ 54 |     bitLengthVerifier.in[1] <== maxBitsPadded;
+ 55 |     bitLengthVerifier.out === 1;
+ 56 | 
+ 57 |     // Note that we can no longer do padded verification efficiently inside the SHA because it requires non deterministic array indexing.
+ 58 |     // We can do it if we add a constraint, but since guessing a valid SHA2 preimage is hard anyways, we'll just do it outside the circuit.
+ 59 | 
+ 60 |     // signal paddedIn[maxBlocks*512];
+ 61 |     // for (k=0; k<maxBits; k++) {
+ 62 |     //     paddedIn[k] <== in[k];
+ 63 |     // }
+ 64 |     // paddedIn[maxBits] <== 1;
+ 65 |     // for (k=maxBits+1; k<maxBlocks*512-64; k++) {
+ 66 |     //     paddedIn[k] <== 0;
+ 67 |     // }
+ 68 |     // for (k = 0; k< 64; k++) {
+ 69 |     //     paddedIn[maxBlocks*512 - k -1] <== (maxBits >> k)&1;
+ 70 |     // }
+ 71 | 
+ 72 |     component ha0 = H(0);
+ 73 |     component hb0 = H(1);
+ 74 |     component hc0 = H(2);
+ 75 |     component hd0 = H(3);
+ 76 |     component he0 = H(4);
+ 77 |     component hf0 = H(5);
+ 78 |     component hg0 = H(6);
+ 79 |     component hh0 = H(7);
+ 80 | 
+ 81 |     component sha256compression[maxBlocks];
+ 82 | 
+ 83 |     for (i=0; i<maxBlocks; i++) {
+ 84 | 
+ 85 |         sha256compression[i] = Sha256compression() ;
+ 86 | 
+ 87 |         if (i==0) {
+ 88 |             for (k=0; k<32; k++ ) {
+ 89 |                 sha256compression[i].hin[0*32+k] <== ha0.out[k];
+ 90 |                 sha256compression[i].hin[1*32+k] <== hb0.out[k];
+ 91 |                 sha256compression[i].hin[2*32+k] <== hc0.out[k];
+ 92 |                 sha256compression[i].hin[3*32+k] <== hd0.out[k];
+ 93 |                 sha256compression[i].hin[4*32+k] <== he0.out[k];
+ 94 |                 sha256compression[i].hin[5*32+k] <== hf0.out[k];
+ 95 |                 sha256compression[i].hin[6*32+k] <== hg0.out[k];
+ 96 |                 sha256compression[i].hin[7*32+k] <== hh0.out[k];
+ 97 |             }
+ 98 |         } else {
+ 99 |             for (k=0; k<32; k++ ) {
+100 |                 sha256compression[i].hin[32*0+k] <== sha256compression[i-1].out[32*0+31-k];
+101 |                 sha256compression[i].hin[32*1+k] <== sha256compression[i-1].out[32*1+31-k];
+102 |                 sha256compression[i].hin[32*2+k] <== sha256compression[i-1].out[32*2+31-k];
+103 |                 sha256compression[i].hin[32*3+k] <== sha256compression[i-1].out[32*3+31-k];
+104 |                 sha256compression[i].hin[32*4+k] <== sha256compression[i-1].out[32*4+31-k];
+105 |                 sha256compression[i].hin[32*5+k] <== sha256compression[i-1].out[32*5+31-k];
+106 |                 sha256compression[i].hin[32*6+k] <== sha256compression[i-1].out[32*6+31-k];
+107 |                 sha256compression[i].hin[32*7+k] <== sha256compression[i-1].out[32*7+31-k];
+108 |             }
+109 |         }
+110 | 
+111 |         for (k=0; k<512; k++) {
+112 |             sha256compression[i].inp[k] <== paddedIn[i*512+k];
+113 |         }
+114 |     }
+115 | 
+116 |     // Select the correct compression output for the given length, instead of just the last one.
+117 |     component arraySelectors[256];
+118 |     for (k=0; k<256; k++) {
+119 |         arraySelectors[k] = QuinSelector(maxBlocks, maxBlocksBits);
+120 |         for (j=0; j<maxBlocks; j++) {
+121 |             arraySelectors[k].in[j] <== sha256compression[j].out[k];
+122 |         }
+123 |         arraySelectors[k].index <== inBlockIndex - 1; // The index is 0 indexed and the block numbers are 1 indexed.
+124 |         out[k] <== arraySelectors[k].out;
+125 |     }
+126 | 
+127 |     // for (k=0; k<256; k++) {
+128 |     //     out[k] <== sha256compression[maxBlocks-1].out[k];
+129 |     // }
+130 | }
+131 | 
+
+
+--------------------------------------------------------------------------------
+/sdk/circomlib/circuits/sha256partial.circom:
+--------------------------------------------------------------------------------
+  1 | pragma circom 2.1.5;
+  2 | 
+  3 | include "circomlib/circuits/sha256/constants.circom";
+  4 | include "circomlib/circuits/sha256/sha256compression.circom";
+  5 | include "circomlib/circuits/comparators.circom";
+  6 | include "./utils.circom";
+  7 | 
+  8 | include "circomlib/circuits/bitify.circom"; // needed for Num2Bits
+  9 | 
+ 10 | // Completing the sha256 hash given a pre-computed state and additional data
+ 11 | template Sha256Partial(maxBitsPadded) {
+ 12 |     // maxBitsPadded must be a multiple of 512, and the bit circuits in this file are limited to 15 so must be raised if the message is longer.
+ 13 |     assert(maxBitsPadded % 512 == 0);
+ 14 |     var maxBitsPaddedBits = log2_ceil(maxBitsPadded);
+ 15 |     assert(2 ** maxBitsPaddedBits > maxBitsPadded);
+ 16 | 
+ 17 |     // Note that maxBitsPadded = maxBits + 64
+ 18 |     signal input paddedIn[maxBitsPadded];
+ 19 |     signal input pre_state[256];
+ 20 |     signal output out[256];
+ 21 |     signal input in_len_padded_bits; // This is the padded length of the message pre-hash.
+ 22 | 
+ 23 |     signal inBlockIndex;
+ 24 | 
+ 25 |     var i;
+ 26 |     var k;
+ 27 |     var j;
+ 28 |     var maxBlocks;
+ 29 |     var bitsLastBlock;
+ 30 |     maxBlocks = (maxBitsPadded\512);
+ 31 |     var maxBlocksBits = log2_ceil(maxBlocks);
+ 32 |     assert(2 ** maxBlocksBits > maxBlocks);
+ 33 | 
+ 34 |     inBlockIndex <-- (in_len_padded_bits >> 9);
+ 35 |     in_len_padded_bits === inBlockIndex * 512;
+ 36 | 
+ 37 |     // range check for LessEqThan and QuinSelector:
+ 38 |     // constraining in_len_padded_bits to be less than 2^maxBitsPaddedBits
+ 39 |     component lenBits = Num2Bits(maxBitsPaddedBits);
+ 40 |     lenBits.in <== in_len_padded_bits;
+ 41 | 
+ 42 |     // These verify we pass in a valid number of bits to the SHA256 compression circuit.
+ 43 |     component bitLengthVerifier = LessEqThan(maxBitsPaddedBits); // todo verify the length passed in is less than nbits. note that maxBitsPaddedBits can likely be lowered or made it a fn of maxbits
+ 44 |     bitLengthVerifier.in[0] <== in_len_padded_bits;
+ 45 |     bitLengthVerifier.in[1] <== maxBitsPadded;
+ 46 |     bitLengthVerifier.out === 1;
+ 47 | 
+ 48 |     component ha0 = H(0);
+ 49 |     component hb0 = H(1);
+ 50 |     component hc0 = H(2);
+ 51 |     component hd0 = H(3);
+ 52 |     component he0 = H(4);
+ 53 |     component hf0 = H(5);
+ 54 |     component hg0 = H(6);
+ 55 |     component hh0 = H(7);
+ 56 | 
+ 57 |     component sha256compression[maxBlocks];
+ 58 | 
+ 59 |     for (i=0; i<maxBlocks; i++) {
+ 60 | 
+ 61 |         sha256compression[i] = Sha256compression() ;
+ 62 | 
+ 63 |         if (i==0) {
+ 64 |             for (k=0; k<32; k++ ) {
+ 65 |                 sha256compression[i].hin[32*0+k] <== pre_state[32*0+31-k];
+ 66 |                 sha256compression[i].hin[32*1+k] <== pre_state[32*1+31-k];
+ 67 |                 sha256compression[i].hin[32*2+k] <== pre_state[32*2+31-k];
+ 68 |                 sha256compression[i].hin[32*3+k] <== pre_state[32*3+31-k];
+ 69 |                 sha256compression[i].hin[32*4+k] <== pre_state[32*4+31-k];
+ 70 |                 sha256compression[i].hin[32*5+k] <== pre_state[32*5+31-k];
+ 71 |                 sha256compression[i].hin[32*6+k] <== pre_state[32*6+31-k];
+ 72 |                 sha256compression[i].hin[32*7+k] <== pre_state[32*7+31-k];
+ 73 |             }
+ 74 |         } else {
+ 75 |             for (k=0; k<32; k++ ) {
+ 76 |                 sha256compression[i].hin[32*0+k] <== sha256compression[i-1].out[32*0+31-k];
+ 77 |                 sha256compression[i].hin[32*1+k] <== sha256compression[i-1].out[32*1+31-k];
+ 78 |                 sha256compression[i].hin[32*2+k] <== sha256compression[i-1].out[32*2+31-k];
+ 79 |                 sha256compression[i].hin[32*3+k] <== sha256compression[i-1].out[32*3+31-k];
+ 80 |                 sha256compression[i].hin[32*4+k] <== sha256compression[i-1].out[32*4+31-k];
+ 81 |                 sha256compression[i].hin[32*5+k] <== sha256compression[i-1].out[32*5+31-k];
+ 82 |                 sha256compression[i].hin[32*6+k] <== sha256compression[i-1].out[32*6+31-k];
+ 83 |                 sha256compression[i].hin[32*7+k] <== sha256compression[i-1].out[32*7+31-k];
+ 84 |             }
+ 85 |         }
+ 86 | 
+ 87 |         for (k=0; k<512; k++) {
+ 88 |             sha256compression[i].inp[k] <== paddedIn[i*512+k];
+ 89 |         }
+ 90 |     }
+ 91 | 
+ 92 |     // Select the correct compression output for the given length, instead of just the last one.
+ 93 |     component arraySelectors[256];
+ 94 |     for (k=0; k<256; k++) {
+ 95 |         arraySelectors[k] = QuinSelector(maxBlocks, maxBlocksBits);
+ 96 |         for (j=0; j<maxBlocks; j++) {
+ 97 |             arraySelectors[k].in[j] <== sha256compression[j].out[k];
+ 98 |         }
+ 99 |         arraySelectors[k].index <== inBlockIndex - 1; // The index is 0 indexed and the block numbers are 1 indexed.
+100 |         out[k] <== arraySelectors[k].out;
+101 |     }
+102 | 
+103 |     // for (k=0; k<256; k++) {
+104 |     //     out[k] <== sha256compression[maxBlocks-1].out[k];
+105 |     // }
+106 | }
+107 | 
+
+
+--------------------------------------------------------------------------------
+/sdk/circomlib/circuits/string.circom:
+--------------------------------------------------------------------------------
+  1 | pragma circom 2.1.5;
+  2 | 
+  3 | template CharCompare(idx) {
+  4 |   signal input ch;
+  5 |   signal input targetChar;
+  6 |   signal output isMatch;
+  7 | 
+  8 |   isMatch <-- ch == targetChar ? 1 : 0;
+  9 | }
+ 10 | 
+ 11 | template Len(str_max_len) {
+ 12 |   signal input text[str_max_len];
+ 13 |   signal output length;
+ 14 | 
+ 15 |   var tmpLen = 0;
+ 16 | 
+ 17 |   for (var i = 0; i < str_max_len; i++) {
+ 18 |     tmpLen = tmpLen + (text[i] == 0 ? 0 : 1);  // 直接在这里检查每个字符
+ 19 |   }
+ 20 | 
+ 21 |   length <-- tmpLen;
+ 22 | }
+ 23 | 
+ 24 | template CharAt(str_max_len) {
+ 25 |   signal input text[str_max_len];
+ 26 |   signal input index;
+ 27 |   signal output ch;
+ 28 | 
+ 29 |   assert(index >= 0);
+ 30 |   ch <-- index < str_max_len ? text[index] : 0;
+ 31 | }
+ 32 | 
+ 33 | template IndexOf(str_max_len) {
+ 34 |   signal input text[str_max_len];
+ 35 |   signal input startIndex;
+ 36 |   signal input targetChar;
+ 37 |   signal output index;
+ 38 | 
+ 39 |   assert(startIndex >= 0 && startIndex < str_max_len);
+ 40 | 
+ 41 |   var tmpIndex = -1;
+ 42 | 
+ 43 |   for (var i = 0; i < str_max_len; i++) {
+ 44 |     tmpIndex = tmpIndex + (i >= startIndex && tmpIndex == -1 && (text[i] == targetChar) ? (i + 1) : 0);
+ 45 |   }
+ 46 | 
+ 47 |   index <-- tmpIndex;
+ 48 | }
+ 49 | 
+ 50 | template SubString(str_max_len, sub_str_len) {
+ 51 |   signal input text[str_max_len];
+ 52 |   signal input startIndex;
+ 53 |   signal input count;
+ 54 |   signal output substring[sub_str_len];
+ 55 | 
+ 56 |   assert(startIndex >= 0 && startIndex < str_max_len);
+ 57 |   assert(startIndex + count < str_max_len);
+ 58 |   assert(count >= 0 && count < sub_str_len);
+ 59 |  
+ 60 |   component charAts[sub_str_len];
+ 61 |   for (var i = 0; i < sub_str_len; i++) {
+ 62 |     charAts[i] = CharAt(str_max_len);
+ 63 |     charAts[i].text <== text;
+ 64 |     charAts[i].index <-- startIndex + i;
+ 65 | 
+ 66 |     substring[i] <-- i < count ? charAts[i].ch : 0;
+ 67 |   }
+ 68 | }
+ 69 | 
+ 70 | template SplitPart(str_max_len, sep_ch) {
+ 71 |   signal input text[str_max_len];
+ 72 |   signal input startIndex;
+ 73 |   signal output token[str_max_len];
+ 74 |   signal output findIndex;
+ 75 | 
+ 76 |   assert(startIndex >= 0 && startIndex < str_max_len);
+ 77 | 
+ 78 |   component len = Len(str_max_len);
+ 79 |   len.text <== text;
+ 80 | 
+ 81 |   component indexOf = IndexOf(str_max_len);
+ 82 |   indexOf.text <== text;
+ 83 |   indexOf.startIndex <== startIndex;
+ 84 |   indexOf.targetChar <== sep_ch;
+ 85 | 
+ 86 |   component subStr = SubString(str_max_len, str_max_len);
+ 87 |   subStr.text <== text;
+ 88 |   subStr.startIndex <== startIndex;
+ 89 |   subStr.count <-- indexOf.index == -1 ? len.length - startIndex: indexOf.index - startIndex;
+ 90 | 
+ 91 |   token <== subStr.substring;
+ 92 |   findIndex <== indexOf.index;
+ 93 | }
+ 94 | 
+ 95 | template SplitBy(str_max_len, sep_ch, count) {
+ 96 |   signal input text[str_max_len];
+ 97 |   signal output out[count][str_max_len];
+ 98 | 
+ 99 |   var currentIndex = 0;
+100 | 
+101 |   component splitParts[count];
+102 |   for (var i = 0; i < count; i++) {
+103 |     splitParts[i] = SplitPart(str_max_len, sep_ch);
+104 |     splitParts[i].text <== text;
+105 |     splitParts[i].startIndex <-- currentIndex;
+106 | 
+107 |     out[i] <== splitParts[i].token;
+108 |     currentIndex = splitParts[i].findIndex == -1 ? 0 : splitParts[i].findIndex + 1;
+109 |   }
+110 | }
+111 | 
+112 | template Concat(str_max_len1, str_max_len2) {
+113 |   signal input text1[str_max_len1];
+114 |   signal input text2[str_max_len2];
+115 |   signal output out[str_max_len1 + str_max_len2];
+116 | 
+117 |   component len1 = Len(str_max_len1);
+118 |   len1.text <== text1;
+119 |   
+120 |   component len2 = Len(str_max_len2);
+121 |   len2.text <== text2;
+122 | 
+123 |   for (var i = 0; i < str_max_len1 + str_max_len2; i++) {
+124 |     out[i] <-- i < len1.length ? text1[i] : (i < len1.length + len2.length ? text2[i - len1.length] : 0);
+125 |   }
+126 | }
+127 | 
+128 | template Concat3(str_max_len1, str_max_len2, str_max_len3) {
+129 |   signal input text1[str_max_len1];
+130 |   signal input text2[str_max_len2];
+131 |   signal input text3[str_max_len3];
+132 |   signal output out[str_max_len1 + str_max_len2 + str_max_len3];
+133 | 
+134 |   component len1 = Len(str_max_len1);
+135 |   len1.text <== text1;
+136 |   
+137 |   component len2 = Len(str_max_len2);
+138 |   len2.text <== text2;
+139 | 
+140 |   component len3 = Len(str_max_len3);
+141 |   len3.text <== text3;
+142 | 
+143 |   for (var i = 0; i < str_max_len1 + str_max_len2 + str_max_len3; i++) {
+144 |     out[i] <-- i < len1.length ? text1[i] : (i < len1.length + len2.length ? text2[i - len1.length] : (i < len1.length + len2.length + len3.length ? text3[i - len1.length - len2.length] : 0));
+145 |   }
+146 | }
+147 | 
+
+
+--------------------------------------------------------------------------------
+/sdk/circomlib/circuits/utils.circom:
+--------------------------------------------------------------------------------
+  1 | pragma circom 2.1.5;
+  2 | 
+  3 | include "circomlib/circuits/bitify.circom";
+  4 | include "circomlib/circuits/comparators.circom";
+  5 | include "circomlib/circuits/mimcsponge.circom";
+  6 | include "./fp.circom";
+  7 | 
+  8 | // returns ceil(log2(a+1))
+  9 | function log2_ceil(a) {
+ 10 |     var n = a+1;
+ 11 |     var r = 0;
+ 12 |     while (n>0) {
+ 13 |         r++;
+ 14 |         n \= 2;
+ 15 |     }
+ 16 |     return r;
+ 17 | }
+ 18 | 
+ 19 | // returns ceil(log2(a+1))
+ 20 | function count_packed(n, chunks) {
+ 21 |     return (n - 1) \ chunks + 1;
+ 22 | }
+ 23 | 
+ 24 | // Lifted from MACI https://github.com/privacy-scaling-explorations/maci/blob/v1/circuits/circom/trees/incrementalQuinTree.circom#L29
+ 25 | // Bits is ceil(log2 choices)
+ 26 | template QuinSelector(choices, bits) {
+ 27 |     signal input in[choices];
+ 28 |     signal input index;
+ 29 |     signal output out;
+ 30 | 
+ 31 |     // Ensure that index < choices
+ 32 |     component lessThan = LessThan(bits);
+ 33 |     lessThan.in[0] <== index;
+ 34 |     lessThan.in[1] <== choices;
+ 35 |     lessThan.out === 1;
+ 36 | 
+ 37 |     component calcTotal = CalculateTotal(choices);
+ 38 |     component eqs[choices];
+ 39 | 
+ 40 |     // For each item, check whether its index equals the input index.
+ 41 |     for (var i = 0; i < choices; i ++) {
+ 42 |         eqs[i] = IsEqual();
+ 43 |         eqs[i].in[0] <== i;
+ 44 |         eqs[i].in[1] <== index;
+ 45 | 
+ 46 |         // eqs[i].out is 1 if the index matches. As such, at most one input to
+ 47 |         // calcTotal is not 0.
+ 48 |         calcTotal.nums[i] <== eqs[i].out * in[i];
+ 49 |     }
+ 50 | 
+ 51 |     // Returns 0 + 0 + ... + item
+ 52 |     out <== calcTotal.sum;
+ 53 | }
+ 54 | 
+ 55 | template CalculateTotal(n) {
+ 56 |     signal input nums[n];
+ 57 |     signal output sum;
+ 58 | 
+ 59 |     signal sums[n];
+ 60 |     sums[0] <== nums[0];
+ 61 | 
+ 62 |     for (var i=1; i < n; i++) {
+ 63 |         sums[i] <== sums[i - 1] + nums[i];
+ 64 |     }
+ 65 | 
+ 66 |     sum <== sums[n - 1];
+ 67 | }
+ 68 | 
+ 69 | // Written by us
+ 70 | // n bytes per signal, n = 31 usually
+ 71 | template Packed2Bytes(n){
+ 72 |     signal input in; // < 2 ^ (8 * 31)
+ 73 |     signal output out[n]; // each out is < 64
+ 74 |     // Rangecheck in and out?
+ 75 | 
+ 76 |     // Constrain bits
+ 77 |     component nbytes = Num2Bits(8 * n);
+ 78 |     nbytes.in <== in;
+ 79 |     component bytes[n];
+ 80 | 
+ 81 |     for (var k = 0; k < n; k++){
+ 82 |         // Witness gen out
+ 83 |         out[k] <-- (in >> (k * 8)) % 256;
+ 84 | 
+ 85 |         // Constrain bits to match
+ 86 |         bytes[k] = Num2Bits(8);
+ 87 |         bytes[k].in <== out[k];
+ 88 |         for (var j = 0; j < 8; j++) {
+ 89 |             nbytes.out[k * 8 + j] === bytes[k].out[j];
+ 90 |         }
+ 91 |     }
+ 92 | }
+ 93 | 
+ 94 | // Written by us
+ 95 | // n bytes per signal, n = 31 usually
+ 96 | template Packed2BytesBigEndian(n){
+ 97 |     signal input in; // < 2 ^ (8 * 31)
+ 98 |     signal output out[n]; // each out is < 64
+ 99 |     // Rangecheck in and out?
+100 | 
+101 |     // Constrain bits
+102 |     component nbytes = Num2Bits(8 * n);
+103 |     nbytes.in <== in;
+104 |     component bytes[n];
+105 | 
+106 |     for (var k = 0; k < n; k++){
+107 |         // Witness gen out
+108 |         out[k] <-- (in >> ((n - k - 1) * 8)) % 256;
+109 | 
+110 |         // Constrain bits to match
+111 |         bytes[k] = Num2Bits(8);
+112 |         bytes[k].in <== out[k];
+113 |         for (var j = 0; j < 8; j++) {
+114 |             nbytes.out[(n - k - 1) * 8 + j] === bytes[k].out[j];
+115 |         }
+116 |     }
+117 | }
+118 | 
+119 | // Written by us
+120 | // n bytes per signal, n = 31 usually
+121 | template Bytes2Packed(n){
+122 |     signal input in[n]; // each in is < 64
+123 |     signal pow2[n+1]; // [k] is 2^k
+124 |     signal in_prefix_sum[n+1]; // each [k] is in[0] + 2^8 in[1]... 2^{8k-8} in[k-1]. cont.
+125 |     // [0] is 0. [1] is in[0]. [n+1] is out.
+126 |     signal output out; // < 2 ^ (8 * 31)
+127 |     // Rangecheck in and out?
+128 | 
+129 |     // Witness gen out
+130 |     in_prefix_sum[0] <-- 0;
+131 |     for (var k = 0; k < n; k++){
+132 |         in_prefix_sum[k+1] <-- in_prefix_sum[k] + in[k] * (2 ** (k * 8));
+133 |     }
+134 |     out <-- in_prefix_sum[n];
+135 | 
+136 |     // Constrain out bits
+137 |     component nbytes = Num2Bits(8 * n);
+138 |     nbytes.in <== out; // I think this auto-rangechecks out to be < 8*n bits.
+139 |     component bytes[n];
+140 | 
+141 |     for (var k = 0; k < n; k++){
+142 |         bytes[k] = Num2Bits(8);
+143 |         bytes[k].in <== in[k];
+144 |         for (var j = 0; j < 8; j++) {
+145 |             nbytes.out[k * 8 + j] === bytes[k].out[j];
+146 |         }
+147 |     }
+148 | }
+149 | 
+150 | template Bytes2PackedBigEndian(n){
+151 |     signal input in[n]; // each in is < 64
+152 |     signal pow2[n+1]; // [k] is 2^k
+153 |     signal in_prefix_sum[n+1]; // each [k] is in[0] + 2^8 in[1]... 2^{8k-8} in[k-1]. cont.
+154 |     // [0] is 0. [1] is in[0]. [n+1] is out.
+155 |     signal output out; // < 2 ^ (8 * 31)
+156 |     // Rangecheck in and out?
+157 | 
+158 |     // Witness gen out
+159 |     in_prefix_sum[0] <-- 0;
+160 |     for (var k = 0; k < n; k++){
+161 |         in_prefix_sum[k+1] <-- in_prefix_sum[k] + in[k] * (2 ** ((n - k - 1) * 8));
+162 |     }
+163 |     out <-- in_prefix_sum[n];
+164 | 
+165 |     // Constrain out bits
+166 |     component nbytes = Num2Bits(8 * n);
+167 |     nbytes.in <== out; // I think this auto-rangechecks out to be < 8*n bits.
+168 |     component bytes[n];
+169 | 
+170 |     for (var k = 0; k < n; k++){
+171 |         bytes[k] = Num2Bits(8);
+172 |         bytes[k].in <== in[k];
+173 |         for (var j = 0; j < 8; j++) {
+174 |             nbytes.out[k * 8 + j] === bytes[k].out[j];
+175 |         }
+176 |     }
+177 | }
+178 | 
+179 | // salt_is_message_id_from, custom_anon_from_hashed_salt = MakeAnonEmailSalt(max_email_from_len, max_message_id_len)(email_from, custom_message_id_from, shifted_message_id)
+180 | template MakeAnonEmailSalt(email_len, blinder_len) {
+181 |     signal input email[email_len];
+182 |     signal input custom_message_id[blinder_len]; // previous message id, used to source past account
+183 |     signal input original_message_id[blinder_len]; // previous message id, used to source past account
+184 |     signal intermediate_is_message_id_from[blinder_len + 1];
+185 |     signal isEq[blinder_len];
+186 |     signal output blinder_matches;
+187 |     signal output anon_salt;
+188 | 
+189 |     component hasher = MiMCSponge(email_len + blinder_len, 220, 1);
+190 |     hasher.k <== 123;
+191 |     for (var i = 0; i < email_len; i++) {
+192 |         hasher.ins[i] <== email[i];
+193 |     }
+194 |     intermediate_is_message_id_from[0] <== 1;
+195 |     for (var i = 0; i < blinder_len; i++) {
+196 |         hasher.ins[i + email_len] <== custom_message_id[i];
+197 |         isEq[i] <== IsEqual()([custom_message_id[i], original_message_id[i]]);
+198 |         intermediate_is_message_id_from[i + 1] <== isEq[i] * intermediate_is_message_id_from[i];
+199 |     }
+200 |     blinder_matches <== intermediate_is_message_id_from[blinder_len];
+201 |     anon_salt <== hasher.outs[0];
+202 | }
+203 | 
+
+
+--------------------------------------------------------------------------------
